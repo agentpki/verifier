@@ -1,0 +1,26 @@
+name = "agentpki-verifier"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+workers_dev = true
+
+# Custom domain — uncomment and run `wrangler deploy` after the domain is
+# attached in the Cloudflare dashboard (Workers & Pages > agentpki-verifier
+# > Settings > Domains & Routes).
+#
+# [[routes]]
+# pattern = "verify.agentpki.dev/*"
+# zone_name = "agentpki.dev"
+# custom_domain = true
+
+# Future bindings (v0.2):
+#   - ISSUER_CACHE   : KV namespace for issuer directory persistence
+#   - REPLAY_CACHE   : KV namespace for jti/signature replay detection
+#   - AUDIT_LOG      : D1 database for verification audit trail
+#
+# [[kv_namespaces]]
+# binding = "ISSUER_CACHE"
+# id = "<created via: wrangler kv:namespace create ISSUER_CACHE>"
+
+[vars]
+VERIFIER_ID = "agentpki-verifier-edge"
+SPEC_URL = "https://agentpki.dev/spec/v0.1"

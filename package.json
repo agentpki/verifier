@@ -1,0 +1,19 @@
+{
+  "name": "@agentpki/verifier",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "release": "pnpm --prefix ../sdk-typescript build && wrangler deploy"
+  },
+  "dependencies": {
+    "@agentpki/sdk": "file:../sdk-typescript"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251101.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.95.0"
+  }
+}
