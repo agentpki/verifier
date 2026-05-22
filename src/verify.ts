@@ -1,8 +1,10 @@
 // AgentPKI verification — implements the 12-step procedure of spec §8.2.
 //
-// Returns the structured verdict described in §8.1.2. The handler is pure (no
-// I/O outside fetch for directory resolution + cache reads) so it can run in
-// any Cloudflare Worker isolate.
+// v0.2 additions:
+//   - KV-backed directory cache (cross-isolate persistence)
+//   - CRL revocation check (Step 8)
+//   - Durable-Object replay-detection cache (Mode B integrity)
+//   - Plumbs env (bindings) through for KV / DO access
 
 import {
   parsePassport,
@@ -17,8 +19,10 @@ import {
   type IssuerDirectory,
   type TrustTier,
 } from '@agentpki/sdk';
-import { getCachedDirectory, setCachedDirectory } from './cache.js';
+import { getCachedDirectory, setCachedDirectory, type CacheBindings } from './cache.js';
 import { applyPolicy, type SitePolicy, type PolicyMatch } from './policy.js';
+import { checkRevocation, type CrlBindings } from './crl.js';
+import { checkReplay, type ReplayBindings } from './replay.js';
 
 export interface VerifyRequestBody {
   token: string;
@@ -52,33 +56,42 @@ export interface VerifyResponse {
   failure_reason?: FailureReason;
   failure_detail?: string;
   cached_until?: number;
+  /** When true, the CRL was successfully consulted. False = unknown revocation state. */
+  crl_fresh?: boolean;
+  /** When true, replay-detection DO was consulted (Mode B only). */
+  replay_checked?: boolean;
   verifier_id: string;
 }
 
-const VERIFIER_ID = 'agentpki-verifier-edge';
-const ABUSE_SCORE_PLACEHOLDER = 0.0; // v0.2: real aggregation
+// Combined bindings the verifier consumes from the Worker env
+export interface VerifierBindings extends CacheBindings, CrlBindings, ReplayBindings {}
 
-export async function verifyPassportEdge(body: VerifyRequestBody): Promise<VerifyResponse> {
+const VERIFIER_ID = 'agentpki-verifier-edge';
+const ABUSE_SCORE_PLACEHOLDER = 0.0;
+
+export async function verifyPassportEdge(
+  body: VerifyRequestBody,
+  env: VerifierBindings = {},
+): Promise<VerifyResponse> {
   const now = Math.floor(Date.now() / 1000);
 
   if (!body.token || typeof body.token !== 'string') {
     return failed('malformed', 'missing or non-string `token`');
   }
 
-  // Step 1-2: parse token to peek at iss and footer.kid (NOT trusted yet)
+  // ─── Steps 1-2: parse token (NOT trusted yet) ─────────────────────
   let parsed;
   try {
     parsed = parsePassport(body.token);
   } catch (e) {
     return failed('malformed', e instanceof Error ? e.message : String(e));
   }
-
   const payload = parsed.payload;
   const kid = parsed.footer?.kid;
 
-  // Step 3: resolve issuer directory (cache → fetch)
+  // ─── Step 3: resolve issuer directory (KV → memory → fetch) ───────
   let directory: IssuerDirectory;
-  const cached = getCachedDirectory(payload.iss);
+  const cached = await getCachedDirectory(payload.iss, env);
   if (cached) {
     directory = cached;
   } else {
@@ -90,10 +103,10 @@ export async function verifyPassportEdge(body: VerifyRequestBody): Promise<Verif
       }
       return failed('unknown_issuer', e instanceof Error ? e.message : String(e));
     }
-    setCachedDirectory(payload.iss, directory);
+    await setCachedDirectory(payload.iss, directory, 300, env);
   }
 
-  // Step 4: select pubkey by kid (or fallback)
+  // ─── Step 4: select pubkey by kid ─────────────────────────────────
   const sel = selectKey(directory, kid, now);
   if (sel.status === 'revoked') {
     return failed(
@@ -115,7 +128,7 @@ export async function verifyPassportEdge(body: VerifyRequestBody): Promise<Verif
     );
   }
 
-  // Steps 5-7: signature + temporal checks (SDK handles this)
+  // ─── Steps 5-7: PASETO signature + temporal claims ────────────────
   const verifyRes = verifyPassport(body.token, publicKey, {
     expectedIssuer: payload.iss,
     now,
@@ -124,29 +137,38 @@ export async function verifyPassportEdge(body: VerifyRequestBody): Promise<Verif
     return failed(verifyRes.failureReason ?? 'bad_signature', verifyRes.failureDetail);
   }
 
-  // Step 7 (audience): check site domain against passport.aud
-  // Note: site_policy doesn't currently carry the site domain explicitly;
-  // we leave audience checks to the relying site for v0.1 if aud === "*".
-  if (payload.aud && payload.aud !== '*') {
-    // Without an explicit "expected audience" in the request, we accept any
-    // non-"*" aud passport as valid. Relying sites SHOULD verify aud
-    // matches their own domain after receiving this verdict.
+  // ─── Step 8: CRL revocation check (v0.2) ──────────────────────────
+  const crlCheck = await checkRevocation(payload.jti, directory.crl_url, payload.iss, env);
+  if (crlCheck.revoked) {
+    return failed(
+      'revoked',
+      `jti revoked at ${crlCheck.revoked_at} (${crlCheck.reason ?? 'unknown reason'})`,
+    );
   }
 
-  // Step 8: revocation list (CRL) — v0.1 stub.
-  // Production: fetch directory.crl_url, build/refresh Bloom filter, do
-  // exact-match check when Bloom is positive. See spec §10.3.
-  // Skipped here to keep v0.1 deploy simple; documented as a known gap.
-
-  // Step 9: Mode B signature
+  // ─── Step 9: Mode B signature + replay check (v0.2) ───────────────
+  let replayChecked = false;
   if (body.mode === 'B') {
     const sigCheck = await verifyModeBSignature(body, payload, now);
     if (!sigCheck.ok) {
       return failed(sigCheck.reason, sigCheck.detail);
     }
+    // Replay detection — only if signature already verified
+    if (body.request?.signature) {
+      const replay = await checkReplay(env, payload.jti, body.request.signature);
+      if (replay) {
+        replayChecked = true;
+        if (replay.replay) {
+          return failed(
+            'replay_detected',
+            `signature for jti=${payload.jti} first seen at ${replay.first_seen}`,
+          );
+        }
+      }
+    }
   }
 
-  // Step 10: apply site policy
+  // ─── Step 10: site policy ─────────────────────────────────────────
   const policy = body.site_policy;
   const policyMatch = policy
     ? applyPolicy(policy, {
@@ -157,7 +179,7 @@ export async function verifyPassportEdge(body: VerifyRequestBody): Promise<Verif
       })
     : undefined;
 
-  // Step 11: verdict
+  // ─── Step 11: verdict ─────────────────────────────────────────────
   let verdict: 'allow' | 'throttle' | 'deny' = 'allow';
   let failReason: FailureReason | undefined;
   let failDetail: string | undefined;
@@ -195,6 +217,8 @@ export async function verifyPassportEdge(body: VerifyRequestBody): Promise<Verif
     },
     abuse_score: ABUSE_SCORE_PLACEHOLDER,
     cached_until: Math.min(payload.exp, now + 60),
+    crl_fresh: crlCheck.crl_fresh,
+    replay_checked: replayChecked,
     verifier_id: VERIFIER_ID,
   };
   if (payload.rate) response.rate_limit = payload.rate;

@@ -12,14 +12,38 @@ pattern = "verify.agentpki.dev"
 zone_name = "agentpki.dev"
 custom_domain = true
 
-# Future bindings (v0.2):
-#   - ISSUER_CACHE   : KV namespace for issuer directory persistence
-#   - REPLAY_CACHE   : KV namespace for jti/signature replay detection
-#   - AUDIT_LOG      : D1 database for verification audit trail
+# ─── v0.2 bindings ─────────────────────────────────────────────────────
+# All are OPTIONAL. The verifier degrades gracefully if any are absent:
+#   - ISSUER_CACHE missing → falls back to per-isolate in-memory cache
+#   - CRL_CACHE missing    → CRL fetched fresh on every check (slower)
+#   - ABUSE_REPORTS missing → /v1/abuse/report accepts but doesn't persist
+#   - REPLAY_CACHE missing → replay detection is skipped (Mode B trust drops)
 #
+# Provision the KV namespaces ONCE, then paste the returned IDs below and
+# redeploy. See README for the wrangler commands.
+
 # [[kv_namespaces]]
 # binding = "ISSUER_CACHE"
-# id = "<created via: wrangler kv:namespace create ISSUER_CACHE>"
+# id = "<run: wrangler kv namespace create ISSUER_CACHE>"
+
+# [[kv_namespaces]]
+# binding = "CRL_CACHE"
+# id = "<run: wrangler kv namespace create CRL_CACHE>"
+
+# [[kv_namespaces]]
+# binding = "ABUSE_REPORTS"
+# id = "<run: wrangler kv namespace create ABUSE_REPORTS>"
+
+# Durable Object for cross-isolate replay detection (Mode B)
+# Auto-provisions on first deploy when this stanza is uncommented.
+# [[durable_objects.bindings]]
+# name = "REPLAY_CACHE"
+# class_name = "ReplayCacheDO"
+
+# Required when introducing the new DO class
+# [[migrations]]
+# tag = "v2"
+# new_sqlite_classes = ["ReplayCacheDO"]
 
 [vars]
 VERIFIER_ID = "agentpki-verifier-edge"

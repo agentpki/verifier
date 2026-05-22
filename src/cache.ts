@@ -1,11 +1,12 @@
-// Per-isolate in-memory cache for issuer directory documents.
+// Issuer directory cache — KV-backed (cross-isolate) with in-memory hot-path.
 //
-// Cloudflare Workers reuse the same global module scope across requests within
-// an isolate (with no guarantees, but typically minutes-to-hours of warmth).
-// For v0.1 this gives us "free" caching without provisioning KV.
+// v0.2: persists across Worker isolates via Cloudflare KV when bound.
+// Falls back to per-isolate in-memory cache if KV binding is absent.
 //
-// v0.2 will swap to Workers KV with TTLs derived from Cache-Control headers
-// per spec §6.3.
+// Two-tier read path:
+//   1. Memory cache (≤ 1ms, but only this isolate)
+//   2. KV cache (~10-30ms, shared across all isolates)
+//   3. Origin fetch (~50-200ms, last resort)
 
 import type { IssuerDirectory } from '@agentpki/sdk';
 
@@ -15,25 +16,75 @@ interface CacheEntry {
   expiresAt: number;
 }
 
-const TTL_SECONDS = 300; // 5 min default — matches spec §6.1 Cache-Control hint
+const DEFAULT_TTL = 300; // 5 minutes — matches spec §6.1 Cache-Control hint
 
-const cache = new Map<string, CacheEntry>();
+// Per-isolate hot cache. Persists for the isolate's lifetime (minutes-hours).
+const memCache = new Map<string, CacheEntry>();
 
-export function getCachedDirectory(issuer: string): IssuerDirectory | null {
-  const entry = cache.get(issuer);
-  if (!entry) return null;
-  if (entry.expiresAt < Math.floor(Date.now() / 1000)) {
-    cache.delete(issuer);
-    return null;
-  }
-  return entry.doc;
+export interface CacheBindings {
+  ISSUER_CACHE?: KVNamespace;
 }
 
-export function setCachedDirectory(issuer: string, doc: IssuerDirectory, ttlSeconds: number = TTL_SECONDS): void {
+export async function getCachedDirectory(
+  issuer: string,
+  env: CacheBindings = {},
+): Promise<IssuerDirectory | null> {
   const now = Math.floor(Date.now() / 1000);
-  cache.set(issuer, { doc, fetchedAt: now, expiresAt: now + ttlSeconds });
+
+  // Tier 1: memory cache (this isolate only)
+  const memEntry = memCache.get(issuer);
+  if (memEntry && memEntry.expiresAt > now) {
+    return memEntry.doc;
+  }
+
+  // Tier 2: KV cache (shared across all isolates)
+  if (env.ISSUER_CACHE) {
+    try {
+      const raw = await env.ISSUER_CACHE.get(kvKey(issuer), 'json');
+      if (raw) {
+        const doc = raw as IssuerDirectory;
+        // Re-populate hot cache for this isolate
+        memCache.set(issuer, { doc, fetchedAt: now, expiresAt: now + DEFAULT_TTL });
+        return doc;
+      }
+    } catch {
+      // KV transient errors — fall through to fresh fetch
+    }
+  }
+
+  // If memory entry expired, evict
+  if (memEntry) memCache.delete(issuer);
+
+  return null;
+}
+
+export async function setCachedDirectory(
+  issuer: string,
+  doc: IssuerDirectory,
+  ttlSeconds: number = DEFAULT_TTL,
+  env: CacheBindings = {},
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+
+  // Always populate memory
+  memCache.set(issuer, { doc, fetchedAt: now, expiresAt: now + ttlSeconds });
+
+  // And KV if bound
+  if (env.ISSUER_CACHE) {
+    try {
+      await env.ISSUER_CACHE.put(kvKey(issuer), JSON.stringify(doc), {
+        expirationTtl: Math.max(60, ttlSeconds),
+      });
+    } catch {
+      // KV write failure isn't fatal — memory cache still serves
+    }
+  }
 }
 
 export function cacheStats(): { size: number; issuers: string[] } {
-  return { size: cache.size, issuers: [...cache.keys()] };
+  return { size: memCache.size, issuers: [...memCache.keys()] };
+}
+
+function kvKey(issuer: string): string {
+  return `dir:${issuer}`;
 }
