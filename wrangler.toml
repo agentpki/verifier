@@ -13,37 +13,33 @@ zone_name = "agentpki.dev"
 custom_domain = true
 
 # ─── v0.2 bindings ─────────────────────────────────────────────────────
-# All are OPTIONAL. The verifier degrades gracefully if any are absent:
-#   - ISSUER_CACHE missing → falls back to per-isolate in-memory cache
-#   - CRL_CACHE missing    → CRL fetched fresh on every check (slower)
-#   - ABUSE_REPORTS missing → /v1/abuse/report accepts but doesn't persist
-#   - REPLAY_CACHE missing → replay detection is skipped (Mode B trust drops)
-#
-# Provision the KV namespaces ONCE, then paste the returned IDs below and
-# redeploy. See README for the wrangler commands.
+# Provisioned via:
+#   wrangler kv namespace create <NAME>
+# IDs below come from the responses to those commands. Verifier degrades
+# gracefully if any binding is absent (see src/cache.ts, src/crl.ts, etc).
 
-# [[kv_namespaces]]
-# binding = "ISSUER_CACHE"
-# id = "<run: wrangler kv namespace create ISSUER_CACHE>"
+[[kv_namespaces]]
+binding = "ISSUER_CACHE"
+id = "35af4f0e393f4d0a860f37c44ef15048"
 
-# [[kv_namespaces]]
-# binding = "CRL_CACHE"
-# id = "<run: wrangler kv namespace create CRL_CACHE>"
+[[kv_namespaces]]
+binding = "CRL_CACHE"
+id = "2c1f743f048a4ee8ac67a1c5d7870de4"
 
-# [[kv_namespaces]]
-# binding = "ABUSE_REPORTS"
-# id = "<run: wrangler kv namespace create ABUSE_REPORTS>"
+[[kv_namespaces]]
+binding = "ABUSE_REPORTS"
+id = "b79993f2c7b140178c884b7b148111c5"
 
-# Durable Object for cross-isolate replay detection (Mode B)
-# Auto-provisions on first deploy when this stanza is uncommented.
-# [[durable_objects.bindings]]
-# name = "REPLAY_CACHE"
-# class_name = "ReplayCacheDO"
+# Durable Object for cross-isolate replay detection (Mode B integrity).
+# Auto-provisions on first deploy that includes this stanza.
+[[durable_objects.bindings]]
+name = "REPLAY_CACHE"
+class_name = "ReplayCacheDO"
 
 # Required when introducing the new DO class
-# [[migrations]]
-# tag = "v2"
-# new_sqlite_classes = ["ReplayCacheDO"]
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ReplayCacheDO"]
 
 [vars]
 VERIFIER_ID = "agentpki-verifier-edge"
