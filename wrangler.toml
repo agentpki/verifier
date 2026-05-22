@@ -3,14 +3,14 @@ main = "src/index.ts"
 compatibility_date = "2026-05-01"
 workers_dev = true
 
-# Custom domain — uncomment and run `wrangler deploy` after the domain is
-# attached in the Cloudflare dashboard (Workers & Pages > agentpki-verifier
-# > Settings > Domains & Routes).
-#
-# [[routes]]
-# pattern = "verify.agentpki.dev/*"
-# zone_name = "agentpki.dev"
-# custom_domain = true
+# Custom domain — wrangler auto-creates the DNS record under the agentpki.dev
+# zone on deploy. Required for cross-Worker fetches (same-account workers.dev
+# routing returns 404 on inter-Worker calls; custom domains go through the
+# public edge and work normally).
+[[routes]]
+pattern = "verify.agentpki.dev"
+zone_name = "agentpki.dev"
+custom_domain = true
 
 # Future bindings (v0.2):
 #   - ISSUER_CACHE   : KV namespace for issuer directory persistence
