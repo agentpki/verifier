@@ -44,3 +44,13 @@ new_sqlite_classes = ["ReplayCacheDO"]
 [vars]
 VERIFIER_ID = "agentpki-verifier-edge"
 SPEC_URL = "https://agentpki.dev/spec/v0.1"
+
+# ─── Service bindings ──────────────────────────────────────────────────
+# Direct in-account Worker-to-Worker fetches. Required because same-zone
+# fetches via the public edge bypass our agentpki-self-issuer route and
+# hit Pages instead, returning HTML for /.well-known/agentpki-issuer.json.
+# Bind any internal issuer we operate. External issuers continue to use
+# the global fetch path (which goes through the public edge normally).
+[[services]]
+binding = "SELF_ISSUER"
+service = "agentpki-self-issuer"

@@ -58,12 +58,13 @@ export async function checkRevocation(
   crlUrl: string | undefined,
   issuer: string,
   env: CrlBindings,
+  fetchImpl: typeof fetch = globalThis.fetch,
 ): Promise<RevocationCheck> {
   if (!crlUrl) {
     return { revoked: false, crl_fresh: false };
   }
 
-  const crl = await fetchCrl(issuer, crlUrl, env);
+  const crl = await fetchCrl(issuer, crlUrl, env, fetchImpl);
   if (!crl) {
     return { revoked: false, crl_fresh: false };
   }
@@ -84,6 +85,7 @@ async function fetchCrl(
   issuer: string,
   crlUrl: string,
   env: CrlBindings,
+  fetchImpl: typeof fetch,
 ): Promise<Crl | null> {
   // Tier 1: KV cache
   if (env.CRL_CACHE) {
@@ -100,7 +102,7 @@ async function fetchCrl(
   const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
   let crl: Crl | null = null;
   try {
-    const res = await fetch(crlUrl, {
+    const res = await fetchImpl(crlUrl, {
       headers: { Accept: 'application/json' },
       signal: ctl.signal,
     });

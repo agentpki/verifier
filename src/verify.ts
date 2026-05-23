@@ -23,6 +23,7 @@ import { getCachedDirectory, setCachedDirectory, type CacheBindings } from './ca
 import { applyPolicy, type SitePolicy, type PolicyMatch } from './policy.js';
 import { checkRevocation, type CrlBindings } from './crl.js';
 import { checkReplay, type ReplayBindings } from './replay.js';
+import { makeInternalFetch } from './internal-fetch.js';
 
 export interface VerifyRequestBody {
   token: string;
@@ -64,7 +65,10 @@ export interface VerifyResponse {
 }
 
 // Combined bindings the verifier consumes from the Worker env
-export interface VerifierBindings extends CacheBindings, CrlBindings, ReplayBindings {}
+export interface VerifierBindings extends CacheBindings, CrlBindings, ReplayBindings {
+  /** Service binding to agentpki-self-issuer — bypasses same-zone routing bug. */
+  SELF_ISSUER?: Fetcher;
+}
 
 const VERIFIER_ID = 'agentpki-verifier-edge';
 const ABUSE_SCORE_PLACEHOLDER = 0.0;
@@ -90,13 +94,17 @@ export async function verifyPassportEdge(
   const kid = parsed.footer?.kid;
 
   // ─── Step 3: resolve issuer directory (KV → memory → fetch) ───────
+  // Custom fetch routes known-internal issuers through service bindings to
+  // bypass Cloudflare's same-zone Worker-to-Worker routing short-circuit.
+  const internalFetch = makeInternalFetch(env);
+
   let directory: IssuerDirectory;
   const cached = await getCachedDirectory(payload.iss, env);
   if (cached) {
     directory = cached;
   } else {
     try {
-      directory = await resolveIssuerDirectory(payload.iss);
+      directory = await resolveIssuerDirectory(payload.iss, { fetch: internalFetch });
     } catch (e) {
       if (e instanceof IssuerDirectoryError) {
         return failed('unknown_issuer', e.message);
@@ -138,7 +146,7 @@ export async function verifyPassportEdge(
   }
 
   // ─── Step 8: CRL revocation check (v0.2) ──────────────────────────
-  const crlCheck = await checkRevocation(payload.jti, directory.crl_url, payload.iss, env);
+  const crlCheck = await checkRevocation(payload.jti, directory.crl_url, payload.iss, env, internalFetch);
   if (crlCheck.revoked) {
     return failed(
       'revoked',
