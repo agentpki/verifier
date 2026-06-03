@@ -9,6 +9,8 @@
 // v0.1 seeds trusted-issuers from a hardcoded list; v0.2 will read from KV
 // so adding/removing an issuer doesn't require a deploy.
 
+import { SEVERITY_WEIGHT, weightedSumToScore } from './severity.js';
+
 const TRUSTED_ISSUERS_V1 = [
   {
     issuer: 'demo.agentpki.dev',
@@ -89,11 +91,34 @@ export async function buildReputationSummary(
     return base;
   }
 
-  // Reports are indexed by abuse.ts as one key per report:
-  //   `by-jti:<passport_id>:<report_id>` → reportId (value)
-  // We enumerate via KV.list to get every report against this passport.
-  // Bounded to 100 — beyond that, score is already saturated and additional
-  // reads add cost without changing the verdict.
+  // Fast path: read the pre-aggregated summary scalar maintained by abuse.ts
+  // on each report submit. KV.get is sub-second consistent, so the popup
+  // reflects a new report the moment the user submits, not 60s later.
+  try {
+    const summary = (await env.ABUSE_REPORTS.get(
+      `summary:by-jti:${passportId}`,
+      'json',
+    )) as { count: number; weighted_sum: number; last_ts: number } | null;
+    if (summary) {
+      return {
+        v: 1,
+        passport_id: passportId,
+        abuse_reports_count: summary.count,
+        last_report_at: summary.last_ts || null,
+        reputation_score: weightedSumToScore(summary.weighted_sum),
+        data_available: true,
+        generated_at: now,
+      };
+    }
+  } catch {
+    // Fall through to list-based path
+  }
+
+  // Slow path / fallback: enumerate per-report pointer keys with KV.list.
+  // Used only when there's no summary key (passports reported before this
+  // code, or summary write fell through earlier). KV.list has weaker
+  // consistency (up to 60s), but for older reports that's fine — by then
+  // the records have propagated everywhere.
   let reportIds: string[] = [];
   try {
     const listing = await env.ABUSE_REPORTS.list({
@@ -104,7 +129,6 @@ export async function buildReputationSummary(
       .map((k) => k.name.slice(`by-jti:${passportId}:`.length))
       .filter((id) => id.length > 0);
   } catch {
-    // Treat KV errors as "no data" rather than failing the request
     return base;
   }
 
@@ -132,24 +156,13 @@ export async function buildReputationSummary(
     }
   }
 
-  // Squash to [0, 1] with a simple saturating curve: 5 medium-weight reports
-  // → ~0.6, 15 → ~0.85, 30+ → ~1.0
-  const score = Math.min(1, 1 - Math.exp(-weightedSum / 6));
-
   return {
     v: 1,
     passport_id: passportId,
     abuse_reports_count: reportIds.length,
     last_report_at: lastTs,
-    reputation_score: Math.round(score * 100) / 100,
+    reputation_score: weightedSumToScore(weightedSum),
     data_available: true,
     generated_at: now,
   };
 }
-
-const SEVERITY_WEIGHT: Record<string, number> = {
-  low: 0.1,
-  medium: 0.3,
-  high: 0.6,
-  critical: 1.0,
-};

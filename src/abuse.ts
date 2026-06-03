@@ -16,6 +16,7 @@
 //   - downstream notification (webhook to issuer's abuse_report_url)
 
 import { util } from '@agentpki/sdk';
+import { SEVERITY_WEIGHT } from './severity.js';
 
 export interface AbuseReport {
   v: 1;
@@ -84,7 +85,20 @@ export async function handleAbuseReport(
     received_at: Math.floor(Date.now() / 1000),
   };
 
-  // Persist to KV (3 keys: by report_id, by jti, by agent_id) for indexing
+  // Persist to KV. We write THREE classes of keys per report:
+  //
+  //   1. `report:<id>`           - full report body (for review tooling)
+  //   2. `by-jti:<jti>:<id>`     - pointer index, enumerable via KV.list
+  //   3. `by-agent:<aid>:<id>`   - pointer index by agent_id
+  //
+  // AND we read-modify-write a per-jti summary scalar:
+  //
+  //   4. `summary:by-jti:<jti>`  - { count, weighted_sum, last_ts }
+  //
+  // The summary lets directory.ts compute reputation via a single KV.get,
+  // which is fast-consistent (sub-second). KV.list has up to 60s eventual
+  // consistency for newly-written keys, which would make the popup show
+  // stale Clean / 0 reports for up to a minute after a report submit.
   if (env.ABUSE_REPORTS) {
     const opts = { expirationTtl: REPORT_RETENTION_SECONDS };
     const writes: Promise<void>[] = [
@@ -114,6 +128,19 @@ export async function handleAbuseReport(
       // KV failure shouldn't block a 202 — we already validated; tell reporter
       // we'll review even if we lost durability here. Log for retry pipeline.
       return json({ accepted: true, report_id: reportId, durable: false }, 202);
+    }
+
+    // Maintain the per-jti summary counter for fast reputation reads.
+    // Best-effort read-modify-write: a tiny race window can undercount by 1
+    // on simultaneous submissions, which is acceptable for an abuse signal.
+    // The intentional ordering — pointer writes BEFORE summary write — means
+    // a summary failure leaves the durable trail intact for offline rollup.
+    if (body.passport_jti) {
+      try {
+        await bumpSummary(env.ABUSE_REPORTS, body.passport_jti, body.severity, stored.received_at);
+      } catch {
+        // Summary is a denormalization, not the source of truth — swallow.
+      }
     }
   }
 
@@ -175,5 +202,31 @@ function json(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
+/** Summary record persisted at `summary:by-jti:<jti>`. Updated on each report. */
+export interface JtiReputationSummary {
+  count: number;
+  weighted_sum: number;
+  last_ts: number;
+}
+
+async function bumpSummary(
+  kv: KVNamespace,
+  jti: string,
+  severity: AbuseReport['severity'],
+  receivedAt: number,
+): Promise<void> {
+  const key = `summary:by-jti:${jti}`;
+  const raw = (await kv.get(key, 'json')) as JtiReputationSummary | null;
+  const w = SEVERITY_WEIGHT[severity] ?? 0.3;
+  const next: JtiReputationSummary = {
+    count: (raw?.count ?? 0) + 1,
+    weighted_sum: (raw?.weighted_sum ?? 0) + w,
+    last_ts: Math.max(raw?.last_ts ?? 0, receivedAt),
+  };
+  await kv.put(key, JSON.stringify(next), {
+    expirationTtl: REPORT_RETENTION_SECONDS,
   });
 }
