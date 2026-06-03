@@ -19,7 +19,14 @@ import { util } from '@agentpki/sdk';
 
 export interface AbuseReport {
   v: 1;
-  reporter: string;        // domain of the reporting site
+  reporter: string;        // domain of the reporting site, OR a UUID/installation-id
+                           // when reporter_kind === 'extension'
+  reporter_kind?: 'site' | 'extension' | 'issuer';
+                           // v0.1 default = 'site' (preserves backward-compat with
+                           // pre-extension submissions). Extension reports send
+                           // 'extension' so we can route through a different rate
+                           // limiter and tier the trust signal lower than a known
+                           // site's reports.
   passport_jti?: string;
   agent_id?: string;
   category:
@@ -28,6 +35,10 @@ export interface AbuseReport {
     | 'policy-violation'
     | 'spam'
     | 'scraping-overrun'
+    | 'impersonation'   // v0.1 (extension) — agent claims an issuer it can't prove
+    | 'fraud'           // v0.1 (extension) — payment / harm / phishing
+    | 'harm'            // v0.1 (extension) — user-reported "this agent did damage"
+    | 'scope-violation' // v0.1 (extension) — agent acted outside its declared scope
     | 'other';
   severity: 'low' | 'medium' | 'high' | 'critical';
   occurred_at: number;
@@ -115,14 +126,31 @@ interface ValidationErr { ok: false; error: string }
 function validateReport(r: AbuseReport): ValidationOk | ValidationErr {
   if (r.v !== 1) return { ok: false, error: 'unsupported version' };
   if (typeof r.reporter !== 'string' || r.reporter.length < 3) {
-    return { ok: false, error: 'reporter must be a domain string' };
+    return { ok: false, error: 'reporter must be a string (domain or installation-id)' };
+  }
+  // v0.1: reporter_kind is optional with default 'site' for backward-compat.
+  // Future deploys can flip the default once all callers send it explicitly.
+  if (r.reporter_kind !== undefined) {
+    const validKinds = ['site', 'extension', 'issuer'];
+    if (!validKinds.includes(r.reporter_kind)) {
+      return { ok: false, error: `reporter_kind must be one of: ${validKinds.join(', ')}` };
+    }
+    // Extension reporters must look like a UUID (validated cheaply: 36 chars,
+    // four dashes, hex). Not bulletproof — just rejects obvious garbage.
+    if (r.reporter_kind === 'extension') {
+      const uuidish = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!uuidish.test(r.reporter)) {
+        return { ok: false, error: 'extension reporter must be a UUID' };
+      }
+    }
   }
   if (!r.passport_jti && !r.agent_id) {
     return { ok: false, error: 'at least one of passport_jti or agent_id required' };
   }
   const validCats = [
     'rate-abuse', 'malicious-payload', 'policy-violation',
-    'spam', 'scraping-overrun', 'other',
+    'spam', 'scraping-overrun', 'impersonation', 'fraud',
+    'harm', 'scope-violation', 'other',
   ];
   if (!validCats.includes(r.category)) {
     return { ok: false, error: `category must be one of: ${validCats.join(', ')}` };

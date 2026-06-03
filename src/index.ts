@@ -23,11 +23,12 @@
 import { verifyPassportEdge, type VerifyRequestBody, type VerifierBindings } from './verify.js';
 import { cacheStats } from './cache.js';
 import { handleAbuseReport, type AbuseBindings } from './abuse.js';
+import { buildTrustedIssuers, buildReputationSummary, type ReputationBindings } from './directory.js';
 
 // Re-export the DO class for Cloudflare's runtime to discover it
 export { ReplayCacheDO } from './replay.js';
 
-export interface Env extends VerifierBindings, AbuseBindings {
+export interface Env extends VerifierBindings, AbuseBindings, ReputationBindings {
   VERIFIER_ID: string;
   SPEC_URL: string;
 }
@@ -56,6 +57,8 @@ export default {
         endpoints: {
           verify: 'POST /v1/verify',
           abuse_report: 'POST /v1/abuse/report',
+          trusted_issuers: 'GET /v1/trusted-issuers',
+          reputation: 'GET /v1/passport/:passport_id/reputation',
           health: 'GET /health',
           cache_stats: 'GET /debug/cache',
         },
@@ -82,6 +85,26 @@ export default {
 
     if (req.method === 'POST' && url.pathname === '/v1/abuse/report') {
       return withCors(await handleAbuseReport(req, env));
+    }
+
+    // ─── v0.1 extension support: trusted issuer list + per-passport reputation
+    if (req.method === 'GET' && url.pathname === '/v1/trusted-issuers') {
+      return json(buildTrustedIssuers(), 200, {
+        'Cache-Control': 'public, max-age=600, stale-while-revalidate=3600',
+      });
+    }
+
+    // GET /v1/passport/:passport_id/reputation
+    const repMatch = url.pathname.match(/^\/v1\/passport\/([^/]+)\/reputation$/);
+    if (req.method === 'GET' && repMatch) {
+      const passportId = decodeURIComponent(repMatch[1]!);
+      if (!passportId || passportId.length > 256) {
+        return json({ error: 'invalid_passport_id' }, 400);
+      }
+      const summary = await buildReputationSummary(passportId, env);
+      return json(summary, 200, {
+        'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
+      });
     }
 
     return json({ error: 'not_found', detail: `${req.method} ${url.pathname}` }, 404);
@@ -118,12 +141,13 @@ function withCors(res: Response): Response {
   return new Response(res.body, { status: res.status, headers: newHeaders });
 }
 
-function json(body: unknown, status = 200): Response {
+function json(body: unknown, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       ...CORS_HEADERS,
+      ...extra,
     },
   });
 }
