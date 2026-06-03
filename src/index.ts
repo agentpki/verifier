@@ -102,9 +102,14 @@ export default {
         return json({ error: 'invalid_passport_id' }, 400);
       }
       const summary = await buildReputationSummary(passportId, env);
-      return json(summary, 200, {
-        'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
-      });
+      // Fresh-fetch query (`?fresh=1`) bypasses the edge cache. Used by the
+      // extension on the post-report re-fetch so the user sees their count
+      // increment immediately rather than waiting for the 60s window.
+      const isFresh = url.searchParams.get('fresh') === '1';
+      const cacheControl = isFresh
+        ? 'no-store'
+        : 'public, max-age=60, stale-while-revalidate=300';
+      return json(summary, 200, { 'Cache-Control': cacheControl });
     }
 
     return json({ error: 'not_found', detail: `${req.method} ${url.pathname}` }, 404);

@@ -89,12 +89,20 @@ export async function buildReputationSummary(
     return base;
   }
 
-  // Reports are indexed under `jti:<passport_id>` per-jti, value is a JSON
-  // array of report_ids. The full report bodies live under `report:<id>`.
+  // Reports are indexed by abuse.ts as one key per report:
+  //   `by-jti:<passport_id>:<report_id>` → reportId (value)
+  // We enumerate via KV.list to get every report against this passport.
+  // Bounded to 100 — beyond that, score is already saturated and additional
+  // reads add cost without changing the verdict.
   let reportIds: string[] = [];
   try {
-    const raw = await env.ABUSE_REPORTS.get(`jti:${passportId}`, 'json');
-    if (Array.isArray(raw)) reportIds = raw as string[];
+    const listing = await env.ABUSE_REPORTS.list({
+      prefix: `by-jti:${passportId}:`,
+      limit: 100,
+    });
+    reportIds = listing.keys
+      .map((k) => k.name.slice(`by-jti:${passportId}:`.length))
+      .filter((id) => id.length > 0);
   } catch {
     // Treat KV errors as "no data" rather than failing the request
     return base;
