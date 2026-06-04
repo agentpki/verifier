@@ -24,6 +24,8 @@
 // All responses include `disclaimer: "heuristic_not_proof"` so downstream
 // UIs are forced to treat results as signals, not verification.
 
+import { GENERATED_PHISHING_DOMAINS, GENERATED_PHISHING_METADATA } from './phishing-domains.generated.js';
+
 export interface HeuristicBindings {
   ABUSE_REPORTS?: KVNamespace;
   SAFE_BROWSING_KEY?: string;
@@ -168,19 +170,31 @@ async function checkInternalAbuse(
 }
 
 function checkHardcodedPhishing(domain: string): CheckResult {
-  if (KNOWN_PHISHING_DOMAINS.has(domain)) {
+  // Two layers checked in order of confidence:
+  //   1. Hand-curated set — small, high-confidence baseline (lives in this file)
+  //   2. Generated set — daily refresh from PhishStats + OpenPhish via
+  //      scripts/refresh-phishing-list.mjs
+  const inCurated = KNOWN_PHISHING_DOMAINS.has(domain);
+  const inGenerated = GENERATED_PHISHING_DOMAINS.has(domain);
+  if (inCurated || inGenerated) {
+    const which = inCurated && inGenerated
+      ? 'AgentPKI curated + community-aggregated lists'
+      : inCurated
+        ? 'AgentPKI curated phishing list'
+        : 'community-aggregated phishing feeds (PhishStats, OpenPhish)';
     return {
       name: 'domain_reputation',
-      source: 'agentpki_curated_phishing_list',
+      source: 'agentpki_phishing_lists',
       status: 'flagged',
-      detail: 'This domain appears on AgentPKI\'s curated list of known phishing sites.',
+      detail: `This domain appears on ${which}.`,
+      data: { in_curated: inCurated, in_generated: inGenerated },
     };
   }
   return {
     name: 'domain_reputation',
-    source: 'agentpki_curated_phishing_list',
+    source: 'agentpki_phishing_lists',
     status: 'clean',
-    detail: 'Not on AgentPKI\'s curated phishing list (curation is not exhaustive).',
+    detail: `Not on AgentPKI's curated or aggregated phishing lists (last refresh: ${GENERATED_PHISHING_METADATA.generated_on}, ${KNOWN_PHISHING_DOMAINS.size} curated + ${GENERATED_PHISHING_METADATA.domain_count} aggregated).`,
   };
 }
 

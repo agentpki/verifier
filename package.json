@@ -6,7 +6,9 @@
   "scripts": {
     "check": "tsc --noEmit",
     "dev": "wrangler dev",
-    "release": "pnpm --prefix ../sdk-typescript build && wrangler deploy"
+    "release": "pnpm --prefix ../sdk-typescript build && wrangler deploy",
+    "refresh-phishing": "node scripts/refresh-phishing-list.mjs",
+    "refresh-phishing:dry": "node scripts/refresh-phishing-list.mjs --dry"
   },
   "dependencies": {
     "@agentpki/sdk": "file:../sdk-typescript"
