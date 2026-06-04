@@ -22,12 +22,13 @@ export interface AbuseReport {
   v: 1;
   reporter: string;        // domain of the reporting site, OR a UUID/installation-id
                            // when reporter_kind === 'extension'
-  reporter_kind?: 'site' | 'extension' | 'issuer';
+  reporter_kind?: 'site' | 'extension' | 'issuer' | 'web';
                            // v0.1 default = 'site' (preserves backward-compat with
-                           // pre-extension submissions). Extension reports send
-                           // 'extension' so we can route through a different rate
-                           // limiter and tier the trust signal lower than a known
-                           // site's reports.
+                           // pre-extension submissions). Extension and web reports
+                           // send their own kind so we can route through a
+                           // different rate limiter and tier the trust signal
+                           // lower than a known site's reports. 'web' = a report
+                           // filed from the public agentpki.dev/check verifier UI.
   passport_jti?: string;
   agent_id?: string;
   category:
@@ -158,16 +159,18 @@ function validateReport(r: AbuseReport): ValidationOk | ValidationErr {
   // v0.1: reporter_kind is optional with default 'site' for backward-compat.
   // Future deploys can flip the default once all callers send it explicitly.
   if (r.reporter_kind !== undefined) {
-    const validKinds = ['site', 'extension', 'issuer'];
+    const validKinds = ['site', 'extension', 'issuer', 'web'];
     if (!validKinds.includes(r.reporter_kind)) {
       return { ok: false, error: `reporter_kind must be one of: ${validKinds.join(', ')}` };
     }
-    // Extension reporters must look like a UUID (validated cheaply: 36 chars,
-    // four dashes, hex). Not bulletproof — just rejects obvious garbage.
-    if (r.reporter_kind === 'extension') {
+    // Extension and web reporters must look like a UUID (validated cheaply:
+    // 36 chars, four dashes, hex). Not bulletproof — just rejects obvious
+    // garbage. Issuer/site reporters use domain identifiers and don't get this
+    // validation.
+    if (r.reporter_kind === 'extension' || r.reporter_kind === 'web') {
       const uuidish = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       if (!uuidish.test(r.reporter)) {
-        return { ok: false, error: 'extension reporter must be a UUID' };
+        return { ok: false, error: `${r.reporter_kind} reporter must be a UUID` };
       }
     }
   }

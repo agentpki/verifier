@@ -24,11 +24,18 @@ import { verifyPassportEdge, type VerifyRequestBody, type VerifierBindings } fro
 import { cacheStats } from './cache.js';
 import { handleAbuseReport, type AbuseBindings } from './abuse.js';
 import { buildTrustedIssuers, buildReputationSummary, type ReputationBindings } from './directory.js';
+import { storeVerification, fetchVerification, type VerificationStoreBindings } from './verification-store.js';
+import { handleHeuristicCheck, type HeuristicBindings } from './heuristic.js';
 
 // Re-export the DO class for Cloudflare's runtime to discover it
 export { ReplayCacheDO } from './replay.js';
 
-export interface Env extends VerifierBindings, AbuseBindings, ReputationBindings {
+export interface Env
+  extends VerifierBindings,
+    AbuseBindings,
+    ReputationBindings,
+    VerificationStoreBindings,
+    HeuristicBindings {
   VERIFIER_ID: string;
   SPEC_URL: string;
 }
@@ -59,6 +66,9 @@ export default {
           abuse_report: 'POST /v1/abuse/report',
           trusted_issuers: 'GET /v1/trusted-issuers',
           reputation: 'GET /v1/passport/:passport_id/reputation',
+          verification_store: 'POST /v1/verification/store',
+          verification_fetch: 'GET /v1/verification/:id',
+          check_heuristic: 'POST /v1/check-heuristic',
           health: 'GET /health',
           cache_stats: 'GET /debug/cache',
         },
@@ -92,6 +102,22 @@ export default {
       return json(buildTrustedIssuers(), 200, {
         'Cache-Control': 'public, max-age=600, stale-while-revalidate=3600',
       });
+    }
+
+    // POST /v1/verification/store — persist a verification snapshot for sharing
+    if (req.method === 'POST' && url.pathname === '/v1/verification/store') {
+      return withCors(await storeVerification(req, env));
+    }
+
+    // GET /v1/verification/:id — fetch a stored verification snapshot
+    const storeMatch = url.pathname.match(/^\/v1\/verification\/([0-9a-f]{8,16})$/i);
+    if (req.method === 'GET' && storeMatch) {
+      return withCors(await fetchVerification(storeMatch[1]!, env));
+    }
+
+    // POST /v1/check-heuristic — domain/phone/community heuristic checks
+    if (req.method === 'POST' && url.pathname === '/v1/check-heuristic') {
+      return withCors(await handleHeuristicCheck(req, env));
     }
 
     // GET /v1/passport/:passport_id/reputation
