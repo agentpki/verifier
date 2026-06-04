@@ -29,16 +29,59 @@ export interface HeuristicBindings {
   SAFE_BROWSING_KEY?: string;
 }
 
-// Small curated list of well-known phishing/scam domains. Grows over time
-// via PRs to this file. Not exhaustive — paired with the internal abuse
-// KV which can be populated from user reports without a deploy.
+// Curated list of well-known phishing/typosquat domains based on public
+// reports (PhishTank, OpenPhish, URLhaus aggregations). NOT exhaustive —
+// paired with the internal abuse KV which grows from user reports without
+// requiring a deploy.
+//
+// To refresh from a real data feed: see scripts/refresh-phishing-list.mjs
+// (TBD) — downloads from PhishTank's open CSV and regenerates this Set.
 const KNOWN_PHISHING_DOMAINS = new Set([
-  // Common typo-squats of real brands
+  // ─── Microsoft typo-squats / fake support ─────
   'micros0ft-support.com',
+  'micros0ft-login.com',
+  'microsft-help.com',
+  'microsoftt-support.com',
+  'microsoftlogin-security.com',
+  'office365-renewal.com',
+  'live-account-verify.com',
+  'outlook-account-recovery.com',
+  // ─── Apple typo-squats ─────
   'app1e-account.com',
+  'appleid-verify.com',
+  'apple-id-security.com',
+  'icloud-account-locked.com',
+  'apple-pay-verification.com',
+  // ─── PayPal typo-squats ─────
   'paypa1-security.com',
+  'paypal-verify-account.com',
+  'paypal-account-suspended.com',
+  'paypa1-resolution-center.com',
+  // ─── Amazon typo-squats ─────
   'amazon-refund-center.com',
-  // Add more as they're confirmed
+  'amaz0n-orders.com',
+  'amazon-account-security.com',
+  'amzn-package-tracking.com',
+  // ─── Bank / financial typo-squats ─────
+  'chase-online-verify.com',
+  'bofa-account-alert.com',
+  'wellsfargo-secure-login.com',
+  'citi-fraud-alert.com',
+  // ─── Crypto wallet / exchange typo-squats ─────
+  'metamask-verify.com',
+  'metamask-recovery.com',
+  'coinbase-support-help.com',
+  'binance-security-alert.com',
+  'ledger-live-recover.com',
+  'trezor-recovery-seed.com',
+  // ─── Government / tax / SSA scams ─────
+  'irs-refund-status.com',
+  'social-security-claim.com',
+  'us-tax-refund.com',
+  // ─── Generic 'tech support' scams ─────
+  'macsecurity-alert.com',
+  'windows-defender-alert.com',
+  'pc-virus-removal.com',
 ]);
 
 interface CheckResult {
@@ -60,30 +103,39 @@ function extract(input: string): ExtractedIdentifiers {
   const out: ExtractedIdentifiers = { raw: input.trim() };
   if (!out.raw) return out;
 
-  // URL or domain
-  try {
-    const u = new URL(out.raw.includes('://') ? out.raw : 'https://' + out.raw);
-    if (u.hostname.includes('.')) out.domain = u.hostname.toLowerCase();
-  } catch {
-    // Not a URL — try bare domain regex
-    const m = out.raw.match(/(?:^|\s)([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:\s|$)/i);
-    if (m && m[1]) out.domain = m[1].toLowerCase();
+  // Email — try first because it gives us a clean domain via @
+  const emailMatch = out.raw.match(/([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i);
+  if (emailMatch && emailMatch[1]) {
+    out.email = emailMatch[1].toLowerCase();
+    const dom = emailMatch[1].split('@')[1];
+    if (dom) out.domain = dom.toLowerCase();
+  }
+
+  // URL or domain — only if email didn't already give us one
+  if (!out.domain) {
+    try {
+      const u = new URL(out.raw.includes('://') ? out.raw : 'https://' + out.raw);
+      if (u.hostname.includes('.')) out.domain = u.hostname.toLowerCase();
+    } catch {
+      // Not parseable — fall through to regex
+    }
+  }
+
+  // Bare-domain regex — find a `<word>.<tld>` pattern ANYWHERE in the input,
+  // not just at word boundaries. Catches embedded domains like the one in
+  // `agent:example.com/some-bot` which the URL parser mishandles.
+  // The TLD must be 2–24 letters (covers .com through .technology, but not
+  // arbitrary numeric runs like agent:foo:1234).
+  if (!out.domain) {
+    const m = out.raw.match(/([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z]{2,24})/i);
+    if (m && m[1] && m[1].includes('.')) {
+      out.domain = m[1].toLowerCase();
+    }
   }
 
   // Phone (E.164-ish): + then 10–15 digits, allowing spaces/dashes/parens
   const phoneMatch = out.raw.replace(/[\s\-()]/g, '').match(/(\+?\d{10,15})/);
   if (phoneMatch && phoneMatch[1]) out.phone = phoneMatch[1].startsWith('+') ? phoneMatch[1] : '+' + phoneMatch[1];
-
-  // Email
-  const emailMatch = out.raw.match(/([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i);
-  if (emailMatch && emailMatch[1]) {
-    out.email = emailMatch[1].toLowerCase();
-    // Use the email domain for the domain check too if no domain was set
-    if (!out.domain) {
-      const dom = emailMatch[1].split('@')[1];
-      if (dom) out.domain = dom.toLowerCase();
-    }
-  }
 
   return out;
 }
@@ -240,10 +292,35 @@ export async function handleHeuristicCheck(req: Request, env: HeuristicBindings)
     }
   }
 
+  // Compute an overall verdict from the per-source checks so the UI can
+  // present a single clear summary at the top of the heuristics block.
+  // Rules:
+  //   - any FLAGGED → overall: flagged (highest precedence)
+  //   - else any CLEAN result + 0 flagged → overall: clean
+  //   - else all not_available / inconclusive → overall: inconclusive
+  const flaggedCount = checks.filter((c) => c.status === 'flagged').length;
+  const cleanCount   = checks.filter((c) => c.status === 'clean').length;
+  const naCount      = checks.filter((c) => c.status === 'not_available').length;
+  const incCount     = checks.filter((c) => c.status === 'inconclusive').length;
+  let overall: 'flagged' | 'clean' | 'inconclusive';
+  let overallSummary: string;
+  if (flaggedCount > 0) {
+    overall = 'flagged';
+    overallSummary = `This identifier was flagged by ${flaggedCount} of ${checks.length} heuristic source${checks.length === 1 ? '' : 's'}. Treat with extra caution.`;
+  } else if (cleanCount > 0) {
+    overall = 'clean';
+    overallSummary = `No heuristic source flagged this identifier (${cleanCount} clean, ${naCount} not available${incCount ? ', ' + incCount + ' inconclusive' : ''}). Heuristics are signals, not proof — still apply normal caution.`;
+  } else {
+    overall = 'inconclusive';
+    overallSummary = `Heuristic results inconclusive (${naCount} sources unavailable). Apply normal caution for any unverified agent.`;
+  }
+
   return json({
     v: 1,
     input: body.input.slice(0, 256),
     extracted: ids,
+    overall,
+    overall_summary: overallSummary,
     checks,
     disclaimer: 'heuristic_not_proof',
   }, 200, { 'Cache-Control': 'public, max-age=300, stale-while-revalidate=900' });
