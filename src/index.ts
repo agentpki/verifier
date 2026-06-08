@@ -26,6 +26,7 @@ import { handleAbuseReport, type AbuseBindings } from './abuse.js';
 import { buildTrustedIssuers, buildReputationSummary, type ReputationBindings } from './directory.js';
 import { storeVerification, fetchVerification, type VerificationStoreBindings } from './verification-store.js';
 import { handleHeuristicCheck, type HeuristicBindings } from './heuristic.js';
+import { incrementVerifyStats, getStatsSnapshot, type StatsBindings } from './stats.js';
 
 // Re-export the DO class for Cloudflare's runtime to discover it
 export { ReplayCacheDO } from './replay.js';
@@ -35,7 +36,8 @@ export interface Env
     AbuseBindings,
     ReputationBindings,
     VerificationStoreBindings,
-    HeuristicBindings {
+    HeuristicBindings,
+    StatsBindings {
   VERIFIER_ID: string;
   SPEC_URL: string;
 }
@@ -48,7 +50,7 @@ const CORS_HEADERS: Record<string, string> = {
 };
 
 export default {
-  async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
     if (req.method === 'OPTIONS') {
@@ -69,6 +71,7 @@ export default {
           verification_store: 'POST /v1/verification/store',
           verification_fetch: 'GET /v1/verification/:id',
           check_heuristic: 'POST /v1/check-heuristic',
+          stats: 'GET /v1/stats',
           health: 'GET /health',
           cache_stats: 'GET /debug/cache',
         },
@@ -90,7 +93,15 @@ export default {
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/verify') {
-      return handleVerify(req, env);
+      return handleVerify(req, env, ctx);
+    }
+
+    // GET /v1/stats — public verification counters (started 2026-06-08)
+    if (req.method === 'GET' && url.pathname === '/v1/stats') {
+      const snap = await getStatsSnapshot(env);
+      return json(snap, 200, {
+        'Cache-Control': 'public, max-age=30, stale-while-revalidate=120',
+      });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/abuse/report') {
@@ -142,11 +153,13 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function handleVerify(req: Request, env: Env): Promise<Response> {
+async function handleVerify(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   let body: VerifyRequestBody;
   try {
     body = (await req.json()) as VerifyRequestBody;
   } catch (e) {
+    // Still count the malformed deny in stats so we see real-world parser noise
+    ctx.waitUntil(incrementVerifyStats(env, { verdict: 'deny', failure_reason: 'malformed' }));
     return json(
       {
         verified: false,
@@ -162,6 +175,12 @@ async function handleVerify(req: Request, env: Env): Promise<Response> {
   const start = Date.now();
   const result = await verifyPassportEdge(body, env);
   const elapsed_ms = Date.now() - start;
+
+  // Bump KV counters AFTER returning the response to the user.
+  ctx.waitUntil(incrementVerifyStats(env, {
+    verdict: result.verdict as 'allow' | 'deny',
+    failure_reason: result.failure_reason,
+  }));
 
   return json({ ...result, elapsed_ms });
 }
